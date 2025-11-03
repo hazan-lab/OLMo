@@ -14,6 +14,7 @@ from torch.optim.optimizer import Optimizer as OptimizerBase
 from . import LayerNormBase
 from .config import OptimizerType, SchedulerConfig, SchedulerType, TrainConfig
 from .stu import STU
+from .stu_sandwich import RMSNorm, SandwichSTUBlock
 from .torch_util import get_default_device, is_distributed
 
 __all__ = [
@@ -861,6 +862,18 @@ def get_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict[str, Any]]
             elif pn.endswith("weight") and isinstance(m, nn.Linear):
                 decay.add(fpn)
             elif pn.endswith("weight") and isinstance(m, (LayerNormBase, nn.LayerNorm)):
+                if cfg.optimizer.decay_norm_and_bias:
+                    decay.add(fpn)
+                else:
+                    no_decay.add(fpn)
+            elif pn.endswith("scale") and isinstance(m, RMSNorm):
+                # RMSNorm uses 'scale' instead of 'weight'
+                if cfg.optimizer.decay_norm_and_bias:
+                    decay.add(fpn)
+                else:
+                    no_decay.add(fpn)
+            elif pn == "gate" and isinstance(m, SandwichSTUBlock):
+                # Gated residual gate parameter - treat like bias/norm
                 if cfg.optimizer.decay_norm_and_bias:
                     decay.add(fpn)
                 else:

@@ -205,6 +205,12 @@ class BlockType(StrEnum):
     instead of attention.
     """
 
+    stu_sandwich = "stu_sandwich"
+    """
+    MLP-Sandwich STU block (MLP → STU → MLP) with configurable norm and
+    residual placements for ablation experiments.
+    """
+
 
 class InitFnType(StrEnum):
     mitchell = "mitchell"
@@ -516,6 +522,30 @@ class ModelConfig(BaseConfig):
     - "all": All layers are STU
     - "alternating": Alternate between STU and attention (even layers are STU)
     - "attention_last": STU for all layers except the last one
+    """
+
+    stu_sandwich_norm_type: str = "rms"
+    """
+    Norm type for sandwich blocks: "rms" (RMSNorm) or "layernorm".
+    """
+
+    stu_sandwich_prenorm: bool = True
+    """
+    If True, use Pre-Norm (norm before sandwich). If False, use Post-Norm (norm after sandwich).
+    """
+
+    stu_sandwich_residual_mode: str = "outer"
+    """
+    Residual connection mode for sandwich blocks:
+    - "outer": Standard outer residual wrapping the entire sandwich
+    - "dual": Outer residual + internal skip connection in STU
+    - "inner_mlp": Residual around the projection stack
+    - "gated_outer": Gated outer residual with learned modulation
+    """
+
+    stu_sandwich_dropout: float = 0.0
+    """
+    Dropout probability for sandwich blocks (applied after W2 and inside STU).
     """
 
     @property

@@ -83,8 +83,8 @@ def parse_args():
     parser.add_argument(
         "--venv",
         type=str,
-        default="OLMo-base",
-        help="Virtual environment name (default: OLMo-base)",
+        default="venv",
+        help="Virtual environment name (default: venv)",
     )
     parser.add_argument(
         "--save-script",
