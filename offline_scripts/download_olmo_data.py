@@ -16,6 +16,10 @@ from urllib.parse import urlparse
 
 def download_file(url: str, local_path: Path, max_retries: int = 5) -> bool:
     """Download a single file with retry logic. Supports both HTTP and S3 URLs."""
+    # Skip if file already exists
+    if local_path.exists():
+        return True
+    
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
     parsed = urlparse(url)
@@ -187,7 +191,7 @@ def main():
     parser = argparse.ArgumentParser(description="Download OLMo training data locally")
     parser.add_argument("--config", "-c", type=str, default=None,
                        help="Path to config file")
-    parser.add_argument("--output-dir", "-o", type=str, default="./olmo_data",
+    parser.add_argument("--output-dir", "-o", type=str, default="/scratch/gpfs/EHAZAN/tharuntk/OLMo-data",
                        help="Directory to save downloaded data")
     parser.add_argument("--max-workers", "-w", type=int, default=2,
                        help="Maximum number of concurrent downloads")
