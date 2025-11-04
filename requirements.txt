@@ -1,4 +1,7 @@
+<<<<<<< HEAD
 -e file:///home/tt6444/ssm-attention-routing/OLMo
+=======
+>>>>>>> 8ed686f7874e785580c43eb5b1d1a216f98aef20
 ai2-olmo-core==2.3.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.12.15

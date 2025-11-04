@@ -679,6 +679,14 @@ class OLMoBlock(nn.Module):
             if phi is None or n is None:
                 raise ValueError("STU blocks require 'phi' and 'n' parameters")
             return OLMoSTUBlock(layer_id, config, phi, n)
+        elif config.block_type == BlockType.stu_sandwich:
+            # MLP-Sandwich STU blocks need phi and n parameters
+            from .stu_sandwich import SandwichSTUBlock
+            phi = kwargs.get('phi')
+            n = kwargs.get('n')
+            if phi is None or n is None:
+                raise ValueError("Sandwich STU blocks require 'phi' and 'n' parameters")
+            return SandwichSTUBlock(layer_id, config, phi, n)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
@@ -1123,7 +1131,9 @@ class OLMo(nn.Module):
         # Initialize STU filters if needed
         self.__stu_phi = None
         self.__stu_n = None
-        if config.stu_layer_schedule is not None:
+        # Initialize STU filters for scheduled STU layers OR if block_type is stu/stu_sandwich
+        if (config.stu_layer_schedule is not None or 
+            config.block_type in [BlockType.stu, BlockType.stu_sandwich]):
             from .stu import get_spectral_filters, nearest_power_of_two
             self.__stu_n = nearest_power_of_two(config.max_sequence_length * 2 - 1, round_up=True)
             self.__stu_phi = get_spectral_filters(
@@ -1144,6 +1154,9 @@ class OLMo(nn.Module):
                 config.block_type = BlockType.stu
                 blocks.append(OLMoBlock.build(i, config, self.__cache, phi=self.__stu_phi, n=self.__stu_n))
                 config.block_type = original_block_type
+            elif config.block_type in [BlockType.stu, BlockType.stu_sandwich]:
+                # If block_type is already stu or stu_sandwich, build directly
+                blocks.append(OLMoBlock.build(i, config, self.__cache, phi=self.__stu_phi, n=self.__stu_n))
             else:
                 blocks.append(OLMoBlock.build(i, config, self.__cache))
         

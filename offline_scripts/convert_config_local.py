@@ -7,7 +7,11 @@ import argparse
 from pathlib import Path
 
 def convert_config_to_local(input_config: Path, output_config: Path, data_dir: Path):
+<<<<<<< HEAD
     """Convert HTTP/S3 URLs in config to local file paths."""
+=======
+    """Convert HTTP URLs in config to local file paths."""
+>>>>>>> 8ed686f7874e785580c43eb5b1d1a216f98aef20
     
     with open(input_config, 'r') as f:
         content = f.read()
@@ -18,6 +22,7 @@ def convert_config_to_local(input_config: Path, output_config: Path, data_dir: P
         f"{data_dir.absolute()}/"
     )
     
+<<<<<<< HEAD
     # Replace HTTPS URLs with local paths
     content = content.replace(
         "https://olmo-data.org/",
@@ -47,6 +52,14 @@ def convert_config_to_local(input_config: Path, output_config: Path, data_dir: P
             f"{data_dir.absolute()}/checkpoints/"
         )
     
+=======
+    # Update save folder to local path
+    content = content.replace(
+        "save_folder: http://olmo-data.org/checkpoints/OLMo-small/${run_name}",
+        f"save_folder: {data_dir.absolute()}/checkpoints/OLMo-small/${{run_name}}"
+    )
+    
+>>>>>>> 8ed686f7874e785580c43eb5b1d1a216f98aef20
     with open(output_config, 'w') as f:
         f.write(content)
     
@@ -54,6 +67,7 @@ def convert_config_to_local(input_config: Path, output_config: Path, data_dir: P
 
 def main():
     parser = argparse.ArgumentParser(description="Convert OLMo config to use local data paths")
+<<<<<<< HEAD
     parser.add_argument("--input-config", "-i", type=str, default=None,
                        help="Input config file")
     parser.add_argument("--output-config", "-o", type=str, default=None,
@@ -61,10 +75,20 @@ def main():
     parser.add_argument("--config-folder", "-f", type=str, default=None,
                        help="Folder containing config files to convert (updates in-place)")
     parser.add_argument("--data-dir", "-d", type=str, default="/scratch/gpfs/EHAZAN/tharuntk/OLMo-data",
+=======
+    parser.add_argument("--input-config", "-i", type=str, 
+                       default="configs/official-0425/OLMo2-1B-stage1-10B-tokens.yaml",
+                       help="Input config file")
+    parser.add_argument("--output-config", "-o", type=str,
+                       default="OLMo2-1B-stage1-10B-tokens-local.yaml",
+                       help="Output config file")
+    parser.add_argument("--data-dir", "-d", type=str, default="./olmo_data",
+>>>>>>> 8ed686f7874e785580c43eb5b1d1a216f98aef20
                        help="Local data directory")
     
     args = parser.parse_args()
     
+<<<<<<< HEAD
     data_dir = Path(args.data_dir)
     
     if args.config_folder:
@@ -98,6 +122,17 @@ def main():
         convert_config_to_local(input_config, output_config, data_dir)
     else:
         parser.error("Either --input-config or --config-folder must be provided")
+=======
+    input_config = Path(args.input_config)
+    output_config = Path(args.output_config)
+    data_dir = Path(args.data_dir)
+    
+    if not input_config.exists():
+        print(f"Input config file not found: {input_config}")
+        return
+    
+    convert_config_to_local(input_config, output_config, data_dir)
+>>>>>>> 8ed686f7874e785580c43eb5b1d1a216f98aef20
 
 if __name__ == "__main__":
     main()
