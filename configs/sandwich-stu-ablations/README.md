@@ -10,6 +10,10 @@ The MLP-Sandwich block implements: **MLP_in → STU → MLP_out**
 - `STU`: Spectral Transform Unit operating in hidden space
 - `MLP_out`: Projects back from `d_hidden` to `d_model`
 
+**Note**: These experiments use the unified `OLMoSTUBlock` from `olmo/stu.py` with 
+`stu_enable_mlp_sandwich: true`. The sandwich features (residual modes, dropout, 
+norm placement) are configured via `stu_sandwich_*` config parameters.
+
 ## Ablation Dimensions
 
 ### Fixed Parameters (Across All Experiments)

@@ -514,6 +514,27 @@ class ModelConfig(BaseConfig):
     ``mlp_hidden_size`` if set, otherwise ``mlp_ratio * d_model``.
     """
 
+    stu_disable_ff: bool = False
+    """
+    When ``True``, disable the feedforward (MLP) path in STU blocks, leaving only
+    the STU path. This creates a single-path architecture similar to the sandwich
+    block but without the MLP wrapper around STU.
+    """
+
+    stu_norm_after: Optional[bool] = None
+    """
+    Apply norm after the STU layer rather than before. If ``None``, falls back to
+    ``norm_after`` config. This allows independent control of norm placement for
+    STU vs feedforward paths.
+    """
+
+    stu_ff_norm_after: Optional[bool] = None
+    """
+    Apply norm after the feedforward layer rather than before (only applies if
+    ``stu_disable_ff`` is ``False``). If ``None``, falls back to ``norm_after``
+    config. This allows independent control of norm placement for STU vs feedforward paths.
+    """
+
     stu_layer_schedule: Optional[str] = None
     """
     Schedule for placing STU layers. Options:

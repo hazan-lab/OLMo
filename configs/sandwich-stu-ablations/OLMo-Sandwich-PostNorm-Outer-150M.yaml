@@ -45,6 +45,10 @@ model:
   stu_use_hankel_L: false
   stu_use_approx: true
   
+  # MLP Sandwich configuration
+  stu_enable_mlp_sandwich: true  # Enable MLP sandwich around STU
+  stu_mlp_hidden_size: null      # null = use mlp_ratio * d_model (6144 for 150M)
+  
   # Sandwich-specific ablation settings
   stu_sandwich_norm_type: rms
   stu_sandwich_prenorm: false  # Post-Norm (CHANGED)

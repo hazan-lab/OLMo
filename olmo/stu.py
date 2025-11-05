@@ -229,9 +229,35 @@ class OLMoSTUBlock(nn.Module):
     """
     OLMo-style block using STU instead of attention.
     
-    This block follows the same structure as OLMoSequentialBlock:
+    By default, this block follows the same structure as OLMoSequentialBlock:
     x -> LayerNorm -> STU -> Residual
     x -> LayerNorm -> MLP -> Residual
+    
+    Configurable options:
+    - ``stu_disable_ff``: When ``True``, disables the feedforward path, leaving only:
+      x -> LayerNorm -> STU -> Residual
+    
+    - ``stu_norm_after``: Controls norm placement for STU path (pre-norm if False, post-norm if True)
+      If None, falls back to ``norm_after`` config.
+    
+    - ``stu_ff_norm_after``: Controls norm placement for FF path (pre-norm if False, post-norm if True)
+      If None, falls back to ``norm_after`` config. Only applies if ``stu_disable_ff`` is False.
+    
+    - ``stu_enable_mlp_sandwich``: When ``True``, wraps STU with MLP_in->STU->MLP_out sandwich
+    
+    - ``stu_sandwich_prenorm``: Controls norm placement for sandwich mode (pre-norm if True)
+    
+    - ``stu_sandwich_residual_mode``: Residual connection mode for sandwich:
+      * "outer": Standard outer residual
+      * "dual": Outer + internal skip in STU
+      * "inner_mlp": Residual after MLP_in
+      * "gated_outer": Gated outer residual
+    
+    - ``stu_sandwich_dropout``: Dropout probability for sandwich mode
+    
+    - ``stu_sandwich_norm_type``: Norm type for sandwich ("rms" or "layernorm")
+    
+    This matches the Flash-STU layer structure when using pre-norm for both paths.
     """
 
     def __init__(
@@ -258,17 +284,31 @@ class OLMoSTUBlock(nn.Module):
         # Import here to avoid circular imports
         from .model import Activation, Dropout, LayerNormBase
 
-        # Dropout
-        self.dropout = Dropout(config.residual_dropout)
-
-        # Layer norms
-        self.stu_norm = LayerNormBase.build(config, size=config.d_model)
-        self.ff_norm = LayerNormBase.build(config, size=config.d_model)
-
-        # STU module
+        # Determine if we're using sandwich mode
         self.stu_mlp_enabled = config.stu_enable_mlp_sandwich
-
+        
+        # Sandwich-specific settings
         if self.stu_mlp_enabled:
+            self.sandwich_prenorm = config.stu_sandwich_prenorm
+            self.sandwich_residual_mode = config.stu_sandwich_residual_mode
+            self.sandwich_dropout_prob = config.stu_sandwich_dropout
+            
+            # Build norm for sandwich mode
+            if config.stu_sandwich_norm_type == "rms":
+                from .model import RMSLayerNorm
+                self.stu_norm = RMSLayerNorm(
+                    config.d_model,
+                    eps=config.layer_norm_eps or 1e-5,
+                    elementwise_affine=config.layer_norm_with_affine,
+                    bias=config.bias_for_layer_norm,
+                )
+            else:  # layernorm
+                self.stu_norm = LayerNormBase.build(config, size=config.d_model)
+            
+            # Dropout for sandwich mode
+            self.sandwich_dropout = nn.Dropout(self.sandwich_dropout_prob) if self.sandwich_dropout_prob > 0.0 else None
+            
+            # Determine hidden size for sandwich
             self.stu_mlp_hidden_size = (
                 config.stu_mlp_hidden_size
                 if config.stu_mlp_hidden_size is not None
@@ -278,16 +318,36 @@ class OLMoSTUBlock(nn.Module):
                     else config.mlp_ratio * config.d_model
                 )
             )
+            
+            # MLP_in uses activation (typically SwiGLU for sandwich)
             self.stu_mlp_act = Activation.build(config)
             assert (self.stu_mlp_act.output_multiplier * self.stu_mlp_hidden_size) % 1 == 0
             self.stu_inner_dim = int(self.stu_mlp_act.output_multiplier * self.stu_mlp_hidden_size)
-
+            
             self.stu_mlp_in_proj = nn.Linear(
                 config.d_model,
                 self.stu_mlp_hidden_size,
                 bias=config.include_bias,
                 device=config.init_device,
             )
+            
+            # Inner-MLP residual adapter (for "inner_mlp" mode)
+            self.use_inner_mlp_residual = (self.sandwich_residual_mode == "inner_mlp")
+            if self.use_inner_mlp_residual:
+                self.inner_mlp_adapter = nn.Linear(
+                    self.stu_inner_dim,
+                    config.d_model,
+                    bias=False,
+                    device=config.init_device,
+                )
+            else:
+                self.inner_mlp_adapter = None
+            
+            # STU with optional dual residual
+            self.use_dual_residual = (self.sandwich_residual_mode == "dual")
+            self.stu = STU(config, phi, n, feature_dim=self.stu_inner_dim)
+            
+            # MLP_out
             self.stu_mlp_out_proj = nn.Linear(
                 self.stu_inner_dim,
                 config.d_model,
@@ -295,31 +355,70 @@ class OLMoSTUBlock(nn.Module):
                 device=config.init_device,
             )
             self.stu_mlp_out_proj._is_residual = True  # type: ignore
-            stu_feature_dim = self.stu_inner_dim
+            
+            # Gated outer residual (for "gated_outer" mode)
+            self.use_gated_residual = (self.sandwich_residual_mode == "gated_outer")
+            if self.use_gated_residual:
+                self.residual_gate = nn.Parameter(torch.zeros(1, device=config.init_device))
+            else:
+                self.residual_gate = None
+            
+            # No FF path in sandwich mode
+            self.ff_enabled = False
+            self.ff_norm = None
+            self.act = None
+            self.ff_proj = None
+            self.ff_out = None
+            self.dropout = None
+            
         else:
+            # Non-sandwich mode: standard dual-path architecture
+            self.dropout = Dropout(config.residual_dropout)
+            
+            # Layer norms
+            self.stu_norm = LayerNormBase.build(config, size=config.d_model)
+            # FF norm only needed if FF path is enabled
+            self.ff_enabled = not config.stu_disable_ff
+            if self.ff_enabled:
+                self.ff_norm = LayerNormBase.build(config, size=config.d_model)
+            else:
+                self.ff_norm = None
+            
+            # Norm placement controls (override global norm_after if specified)
+            self.stu_norm_after = (
+                config.stu_norm_after if config.stu_norm_after is not None else config.norm_after
+            )
+            self.ff_norm_after = (
+                config.stu_ff_norm_after if config.stu_ff_norm_after is not None else config.norm_after
+            )
+            
+            # Simple STU without sandwich
             self.stu_mlp_hidden_size = None
             self.stu_mlp_act = None
             self.stu_inner_dim = config.d_model
             self.stu_mlp_in_proj = nn.Identity()
             self.stu_mlp_out_proj = nn.Identity()
-            stu_feature_dim = None
-
-        self.stu = STU(config, phi, n, feature_dim=stu_feature_dim)
-
-        # MLP (feed-forward)
-        self.act = Activation.build(config)
-        assert (self.act.output_multiplier * self.hidden_size) % 1 == 0
-
-        self.ff_proj = nn.Linear(
-            config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
-        )
-        self.ff_out = nn.Linear(
-            int(self.act.output_multiplier * self.hidden_size),
-            config.d_model,
-            bias=config.include_bias,
-            device=config.init_device,
-        )
-        self.ff_out._is_residual = True  # type: ignore
+            self.stu = STU(config, phi, n, feature_dim=None)
+            
+            # MLP (feed-forward) - only create if FF path is enabled
+            if self.ff_enabled:
+                self.act = Activation.build(config)
+                assert (self.act.output_multiplier * self.hidden_size) % 1 == 0
+                
+                self.ff_proj = nn.Linear(
+                    config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
+                )
+                self.ff_out = nn.Linear(
+                    int(self.act.output_multiplier * self.hidden_size),
+                    config.d_model,
+                    bias=config.include_bias,
+                    device=config.init_device,
+                )
+                self.ff_out._is_residual = True  # type: ignore
+            else:
+                self.act = None
+                self.ff_proj = None
+                self.ff_out = None
 
         self._activation_checkpoint_fn: Optional[callable] = None
 
@@ -327,8 +426,13 @@ class OLMoSTUBlock(nn.Module):
         """Initialize block parameters."""
         from .initialization import init_normal
 
-        self.stu_norm.reset_parameters()
-        self.ff_norm.reset_parameters()
+        # Reset norm
+        if hasattr(self.stu_norm, 'reset_parameters'):
+            self.stu_norm.reset_parameters()
+        if self.ff_enabled and hasattr(self.ff_norm, 'reset_parameters'):
+            self.ff_norm.reset_parameters()
+        
+        # Reset STU
         self.stu.reset_parameters()
 
         # Initialize projections based on config
@@ -336,7 +440,7 @@ class OLMoSTUBlock(nn.Module):
             std = self.config.init_std
             cutoff_factor = self.config.init_cutoff_factor
         elif self.config.init_fn == "mitchell":
-            std = 1 / math.sqrt(self.config.d_model)
+            std = 1.0 / math.sqrt(self.config.d_model)
             cutoff_factor = self.config.init_cutoff_factor or 3.0
         elif self.config.init_fn == "full_megatron":
             std = self.config.init_std
@@ -345,27 +449,17 @@ class OLMoSTUBlock(nn.Module):
             std = self.config.init_std
             cutoff_factor = self.config.init_cutoff_factor
 
-        init_normal(self.ff_proj, std, cutoff_factor)
-
         if self.stu_mlp_enabled:
+            # Initialize MLP_in
             init_normal(self.stu_mlp_in_proj, std, cutoff_factor)
-
-        # Output projection with layer-dependent std
-        if self.config.init_fn == "mitchell":
-            ff_out_std = 1 / math.sqrt(2 * self.ff_out.in_features * (self.layer_id + 1))
-            cutoff_factor = self.config.init_cutoff_factor or 3.0
-        elif self.config.init_fn == "full_megatron":
-            ff_out_std = self.config.init_std / math.sqrt(2.0 * self.config.n_layers)
-            cutoff_factor = self.config.init_cutoff_factor or 3.0
-        else:
-            ff_out_std = self.config.init_std
-            cutoff_factor = self.config.init_cutoff_factor
-
-        init_normal(self.ff_out, ff_out_std, cutoff_factor)
-
-        if self.stu_mlp_enabled:
+            
+            # Initialize inner-MLP adapter if used
+            if self.use_inner_mlp_residual:
+                init_normal(self.inner_mlp_adapter, std, cutoff_factor)
+            
+            # Initialize MLP_out with layer-dependent std (for residual path)
             if self.config.init_fn == "mitchell":
-                stu_out_std = 1 / math.sqrt(2 * self.stu_mlp_out_proj.in_features * (self.layer_id + 1))
+                stu_out_std = 1.0 / math.sqrt(2 * self.stu_mlp_out_proj.in_features * (self.layer_id + 1))
                 stu_cutoff = self.config.init_cutoff_factor or 3.0
             elif self.config.init_fn == "full_megatron":
                 stu_out_std = self.config.init_std / math.sqrt(2.0 * self.config.n_layers)
@@ -374,6 +468,26 @@ class OLMoSTUBlock(nn.Module):
                 stu_out_std = self.config.init_std
                 stu_cutoff = self.config.init_cutoff_factor
             init_normal(self.stu_mlp_out_proj, stu_out_std, stu_cutoff)
+            
+            # Initialize gate (if used) at 0 so model learns to "add in" the sandwich
+            if self.use_gated_residual:
+                nn.init.zeros_(self.residual_gate)
+        else:
+            # Non-sandwich mode
+            if self.ff_enabled:
+                init_normal(self.ff_proj, std, cutoff_factor)
+                
+                # Output projection with layer-dependent std
+                if self.config.init_fn == "mitchell":
+                    ff_out_std = 1.0 / math.sqrt(2 * self.ff_out.in_features * (self.layer_id + 1))
+                    cutoff_factor = self.config.init_cutoff_factor or 3.0
+                elif self.config.init_fn == "full_megatron":
+                    ff_out_std = self.config.init_std / math.sqrt(2.0 * self.config.n_layers)
+                    cutoff_factor = self.config.init_cutoff_factor or 3.0
+                else:
+                    ff_out_std = self.config.init_std
+                    cutoff_factor = self.config.init_cutoff_factor
+                init_normal(self.ff_out, ff_out_std, cutoff_factor)
 
     def set_activation_checkpointing(self, strategy, checkpoint_func=None):
         """Set activation checkpointing for this block."""
@@ -399,74 +513,112 @@ class OLMoSTUBlock(nn.Module):
         Note: STU blocks don't use attention_bias, layer_past, or cache,
         but we keep the signature for compatibility.
         """
-        # STU path with residual connection
-        if not self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                h = self._activation_checkpoint_fn(self.stu_norm, x)
-            else:
+        if self.stu_mlp_enabled:
+            # Sandwich mode: MLP_in -> STU -> MLP_out
+            residual = x
+            
+            # Apply norm (pre-norm or pass-through for post-norm)
+            if self.sandwich_prenorm:
                 h = self.stu_norm(x)
+            else:
+                h = x
+            
+            # MLP_in with activation
+            h = self.stu_mlp_in_proj(h)
+            h = self.stu_mlp_act(h)
+            
+            # Optional inner-MLP residual (projects back to model dim)
+            if self.use_inner_mlp_residual:
+                h_proj = self.inner_mlp_adapter(h)
+                residual = residual + h_proj
+            
+            # STU core with optional dual residual
+            if self.use_dual_residual:
+                # Dual residual: add skip connection inside STU
+                stu_input = h
+                stu_out = self.stu(stu_input)
+                if self.sandwich_dropout is not None:
+                    stu_out = self.sandwich_dropout(stu_out)
+                h = stu_input + stu_out
+            else:
+                h = self.stu(h)
+            
+            # MLP_out (back to model dim)
+            h = self.stu_mlp_out_proj(h)
+            
+            # Apply dropout
+            if self.sandwich_dropout is not None:
+                h = self.sandwich_dropout(h)
+            
+            # Apply outer residual connection (with optional gating)
+            if self.use_gated_residual:
+                y = residual + torch.sigmoid(self.residual_gate) * h
+            else:
+                y = residual + h
+            
+            # Post-norm (if selected)
+            if not self.sandwich_prenorm:
+                y = self.stu_norm(y)
+            
+            return y, None
+            
         else:
-            h = x
-
-        # Apply STU
-        stu_input = h
-        if self.stu_mlp_enabled:
-            if self._activation_checkpoint_fn is not None:
-                stu_input = self._activation_checkpoint_fn(self.stu_mlp_in_proj, stu_input)
+            # Non-sandwich mode: standard dual-path architecture
+            # STU path with residual connection
+            # Apply norm before STU if pre-norm
+            if not self.stu_norm_after:
+                if self._activation_checkpoint_fn is not None:
+                    h = self._activation_checkpoint_fn(self.stu_norm, x)
+                else:
+                    h = self.stu_norm(x)
             else:
-                stu_input = self.stu_mlp_in_proj(stu_input)
+                h = x
 
+            # Apply STU
             if self._activation_checkpoint_fn is not None:
-                stu_input = self._activation_checkpoint_fn(self.stu_mlp_act, stu_input)
+                stu_out = self._activation_checkpoint_fn(self.stu, h)
             else:
-                stu_input = self.stu_mlp_act(stu_input)
+                stu_out = self.stu(h)
 
-        if self._activation_checkpoint_fn is not None:
-            stu_out = self._activation_checkpoint_fn(self.stu, stu_input)
-        else:
-            stu_out = self.stu(stu_input)
+            # Apply norm after STU if post-norm
+            if self.stu_norm_after:
+                if self._activation_checkpoint_fn is not None:
+                    stu_out = self._activation_checkpoint_fn(self.stu_norm, stu_out)
+                else:
+                    stu_out = self.stu_norm(stu_out)
 
-        if self.stu_mlp_enabled:
-            if self._activation_checkpoint_fn is not None:
-                stu_out = self._activation_checkpoint_fn(self.stu_mlp_out_proj, stu_out)
-            else:
-                stu_out = self.stu_mlp_out_proj(stu_out)
+            x = x + self.dropout(stu_out)
 
-        if self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                stu_out = self._activation_checkpoint_fn(self.stu_norm, stu_out)
-            else:
-                stu_out = self.stu_norm(stu_out)
+            # Feed-forward path with residual connection (only if enabled)
+            if self.ff_enabled:
+                og_x = x
 
-        x = x + self.dropout(stu_out)
+                # Apply norm before FF if pre-norm
+                if not self.ff_norm_after:
+                    if self._activation_checkpoint_fn is not None:
+                        x = self._activation_checkpoint_fn(self.ff_norm, x)
+                    else:
+                        x = self.ff_norm(x)
 
-        # Feed-forward path with residual connection
-        og_x = x
+                x = self.ff_proj(x)
 
-        if not self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)
-            else:
-                x = self.ff_norm(x)
+                if self._activation_checkpoint_fn is not None:
+                    x = self._activation_checkpoint_fn(self.act, x)
+                else:
+                    x = self.act(x)
 
-        x = self.ff_proj(x)
+                x = self.ff_out(x)
 
-        if self._activation_checkpoint_fn is not None:
-            x = self._activation_checkpoint_fn(self.act, x)
-        else:
-            x = self.act(x)
+                # Apply norm after FF if post-norm
+                if self.ff_norm_after:
+                    if self._activation_checkpoint_fn is not None:
+                        x = self._activation_checkpoint_fn(self.ff_norm, x)
+                    else:
+                        x = self.ff_norm(x)
 
-        x = self.ff_out(x)
+                x = self.dropout(x)
+                x = og_x + x
 
-        if self.config.norm_after:
-            if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)
-            else:
-                x = self.ff_norm(x)
-
-        x = self.dropout(x)
-        x = og_x + x
-
-        # Return None for cache to match OLMoBlock interface
-        return x, None
+            # Return None for cache to match OLMoBlock interface
+            return x, None
 

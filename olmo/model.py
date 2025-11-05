@@ -671,22 +671,22 @@ class OLMoBlock(nn.Module):
             return OLMoSequentialBlock(layer_id, config, cache)
         elif config.block_type == BlockType.llama:
             return OLMoLlamaBlock(layer_id, config, cache)
-        elif config.block_type == BlockType.stu:
-            # STU blocks need phi and n parameters
+        elif config.block_type == BlockType.stu or config.block_type == BlockType.stu_sandwich:
+            # STU blocks (including sandwich mode) need phi and n parameters
             from .stu import OLMoSTUBlock
             phi = kwargs.get('phi')
             n = kwargs.get('n')
             if phi is None or n is None:
                 raise ValueError("STU blocks require 'phi' and 'n' parameters")
+            # For stu_sandwich block type, ensure mlp sandwich is enabled
+            if config.block_type == BlockType.stu_sandwich and not config.stu_enable_mlp_sandwich:
+                # Temporarily enable sandwich mode for this block type
+                original_sandwich = config.stu_enable_mlp_sandwich
+                config.stu_enable_mlp_sandwich = True
+                block = OLMoSTUBlock(layer_id, config, phi, n)
+                config.stu_enable_mlp_sandwich = original_sandwich
+                return block
             return OLMoSTUBlock(layer_id, config, phi, n)
-        elif config.block_type == BlockType.stu_sandwich:
-            # MLP-Sandwich STU blocks need phi and n parameters
-            from .stu_sandwich import SandwichSTUBlock
-            phi = kwargs.get('phi')
-            n = kwargs.get('n')
-            if phi is None or n is None:
-                raise ValueError("Sandwich STU blocks require 'phi' and 'n' parameters")
-            return SandwichSTUBlock(layer_id, config, phi, n)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
